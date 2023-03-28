@@ -1,4 +1,4 @@
-# ML-KSE-HW2
+# KSE-ML-HW2
 
 A prediction of work.ua CVs, open positions and wages.
 
