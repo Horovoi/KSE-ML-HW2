@@ -471,7 +471,7 @@ Here we create a function that choose the best model of each type using RMSE fro
 #| warning: false
 
 # Load pre-estimated models' parameters from the GitHub repo
-fit_list <- readRDS(url("https://github.com/Horovoi/ML-KSE-HW2/blob/main/fit.Rds?raw=true","rb"))
+fit_list <- readRDS(url("https://github.com/Horovoi/ML-KSE-HW2/blob/main/data/fit.Rds?raw=true","rb"))
 
 # Define a helper function to extract the row with the best tuning parameters
 get_best_result = function(caret_fit) {
@@ -931,7 +931,7 @@ for (k in 1:3) {
 #| warning: false
 
 # Load pre-estimated models' parameters from the GitHub repo
-fit_better_list <- readRDS(url("https://github.com/Horovoi/ML-KSE-HW2/blob/main/fit_Dnipro.Rds?raw=true", "rb"))
+fit_better_list <- readRDS(url("https://github.com/Horovoi/ML-KSE-HW2/blob/main/data/fit_Dnipro.Rds?raw=true", "rb"))
 
 pred_better_list <- list()
 
