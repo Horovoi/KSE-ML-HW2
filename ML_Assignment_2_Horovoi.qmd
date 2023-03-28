@@ -1,0 +1,1043 @@
+---
+title: "ML. Assignment 2"
+subtitle: "Find the best forecasting model of work.ua CVs, open positions and wages"
+author: "Mykyta Horovoi"
+format:
+  html:
+    theme: flatly
+    page-layout: article
+    toc: true
+    toc-location: left
+    toc-title: Contents
+    number-sections: true
+    code-fold: false
+    code-tools: true
+    self-contained: true
+    smooth-scroll: true
+---
+
+```{r}
+#| echo: false
+#| output: false
+#| warning: false
+
+# Load packages
+libs <- c("plyr", "tidyverse", "tibble", "tsibble", "tseries", "feasts", "fable", "readxl", "lubridate", "caret", "doParallel", "lattice", "openxlsx", "seasonal", "janitor", "grid", "gridExtra", "plotly", "DT", "gam", "reshape2", "htmltools")
+
+lapply(libs, require, character.only = TRUE)
+```
+
+# Task
+::: {.callout-note appearance="simple"}
+## Task 1
+
+Choose one region (one-team models one-region) and aggregate all categories – sum across categories and create new variables tracking changes in resumes, open position, etc for the entire region. Compute shares of open position in total for each category and plot them over time.
+:::
+
+## Import raw data from the .xlsx file
+
+```{r}
+#| output: false
+#| warning: false
+
+# For this task we use the original, unprocessed Excel file
+xlsx <- loadWorkbook('data/Work.ua_2022.xlsx')
+
+# Extract sheets' name
+sheet_names <- sheets(xlsx)
+
+# Extract sheets with data
+for(i in 2:(length(sheet_names)-2)) {
+  assign(paste0("df_", sheet_names[i]), readWorkbook(xlsx, sheet = i, cols = c(1, 4:7)))
+}
+
+df_combined_monthly <- read_csv("data/data_combined_monthly.csv")
+```
+
+## Create working data sets
+
+Data for this analysis consists of two parts, each of different frequencies:
+
+1.  Records of number of resumes, vacancies and wages from Work.ua --- monthly data prior to 2016M8, weekly afterwards.
+
+2.  Collection of activity indexes --- monthly data.
+
+To build prediction models, we should align all variable to one frequency. For the first part, data prior to August of 2016 remains untouched. Remaining subsample is aggregated into months by taking averages of weekly data on *total resumes*, *total vacancies* and *wages*. After converting all variables to one frequency, we merge the data from Work.ua with activity indexes.
+
+```{r}
+# Correct dates
+df_Total[,1] <- convert_to_date(df_Total[,1], character_fun = lubridate::dmy)
+df_Wage[,1] <- convert_to_date(df_Wage[,1], character_fun = lubridate::dmy)
+
+# Fix names of columns
+names(df_Wage)[names(df_Wage) == 'category2'] <- 'category'
+names(df_Wage)[names(df_Wage) == 'region3'] <- 'region'
+df_Total[(df_Total$category == '!Total'), 4] <- 'Total'
+df_Wage[(df_Wage$category == '!Total'), 4] <- 'Total'
+
+# Select only Zaporijia
+df_Total_Zaporijia <- df_Total %>% filter(region == "Zaporijia")
+df_Wage_Zaporijia <- df_Wage %>% filter(region == "Zaporijia")
+
+# Bind resumes and wages data into one data frame
+df <- merge(df_Total_Zaporijia, df_Wage_Zaporijia)
+
+# Prepare date set of features for Zaporizka oblast
+df_features_Zaporijia <- df_combined_monthly %>% filter(name == "Zaporizka")
+df_features_Zaporijia$month <- paste(df_features_Zaporijia$month,
+                                     df_features_Zaporijia$year, sep = ".")
+df_features_Zaporijia[,4] <- zoo::as.yearmon(unlist(df_features_Zaporijia[,4]), format = "%m.%Y")
+df_features_Zaporijia <- df_features_Zaporijia %>%
+  select(month, tw_count:area_sq_km) %>%
+  mutate(month = yearmonth(month)) %>%
+  as_tsibble(index = month) %>% filter_index("Jan 2013" ~ "2022 Mar")
+
+# Create separate data set for each category
+df_cats_Zaporijia <- list()
+
+# Set vector of names for categories
+cat_names <- unique(df$category)
+
+# Aggregate data
+for(i in 1:length(cat_names)) {
+  df_cats_Zaporijia[[i]] <- df %>% filter(category == cat_names[i])
+  df_cats_Zaporijia[[i]]$month <- floor_date(df_cats_Zaporijia[[i]]$date, "month")
+  temp <- df_cats_Zaporijia[[i]][,2:3]
+  df_cats_Zaporijia[[i]] <- ddply(df_cats_Zaporijia[[i]], "month", numcolwise(mean)) 
+  df_cats_Zaporijia[[i]] <- bind_cols(df_cats_Zaporijia[[i]],
+                                      temp[1:nrow(df_cats_Zaporijia[[i]]),]) %>%
+    mutate(month = yearmonth(month)) %>%
+    select(month, category, region, everything()) %>% 
+    as_tsibble(index = month)
+  df_cats_Zaporijia[[i]] <- full_join(df_cats_Zaporijia[[i]], df_features_Zaporijia, by = "month")
+}
+
+# Set names for objects in lists
+names(df_cats_Zaporijia) <- cat_names
+
+# Calculate a percentage of NA or zeros for number of vacancies in category "Other"
+percent_missed_other_vac <- round(nrow(df_cats_Zaporijia$Other %>%
+       filter(is.na(wg_vacancies) | wg_vacancies == 0))/nrow(df_cats_Zaporijia$Other)*100,2)
+```
+
+It is important to notice, that the resulting data set contains omitted values. Because their number for specific variable is small (1 or 2 per 110 observations), we can safely fill NAs with nearest values. However, the category "Other" contains a lot of missing values, for example `r percent_missed_other_vac`% observations on number of vacancies are absent. Therefor, we won't account for variables from this category during estimation part.
+
+```{r}
+# Select observations from January 2013 to March 2022
+for(i in 1:length(cat_names)) {
+  df_cats_Zaporijia[[i]] <- df_cats_Zaporijia[[i]] %>% filter_index("Jan 2013" ~ "2022 Mar")
+}
+
+# Decrease number of NA — if vacancy wage is NA, set wage to expected one and vice versa
+# Remaining NA are filled with nearest values
+for(i in 1:length(cat_names)) {
+  for(j in 1:nrow(df_cats_Zaporijia[[i]])) {
+    if(is.na(df_cats_Zaporijia[[i]][j,7])) {
+      df_cats_Zaporijia[[i]][j,7] <- df_cats_Zaporijia[[i]][j,6]
+   }
+    if(is.na(df_cats_Zaporijia[[i]][j,6])) {
+     df_cats_Zaporijia[[i]][j,6] <- df_cats_Zaporijia[[i]][j,7]
+   }
+  }
+  df_cats_Zaporijia[[i]] <- df_cats_Zaporijia[[i]] %>% fill(wg_resumes, .direction = 'down')
+  df_cats_Zaporijia[[i]] <- df_cats_Zaporijia[[i]] %>% fill(wg_vacancies, .direction = 'down')
+}
+```
+
+## Calculate aggregate and average values for Zaporijia
+
+As long as the data was transformed to monthly frequency, we can't use existing information on aggregate positions and vacancies for Zaporijia oblast in total. Thus, we recalculate them. For the wages, we take average of all categories.
+
+```{r}
+# Create empty variables for future aggregates
+df_cats_Zaporijia$Total[,4] <- 0
+df_cats_Zaporijia$Total[,5] <- 0
+df_cats_Zaporijia$Total[,6] <- 0
+df_cats_Zaporijia$Total[,7] <- 0
+
+# Calculate sums of variables
+for(i in c(1:28, 30)) {
+  for(j in 4:5) {
+    df_cats_Zaporijia$Total[,j] <- df_cats_Zaporijia$Total[,j] + df_cats_Zaporijia[[i]][,j]
+  }
+  for(j in 6:7) {
+    df_cats_Zaporijia$Total[,j] <- df_cats_Zaporijia$Total[,j] + df_cats_Zaporijia[[i]][,j]
+  }
+}
+
+# Calculate average wages
+df_cats_Zaporijia$Total[,6] <- df_cats_Zaporijia$Total[,6]/(length(cat_names)-1)
+df_cats_Zaporijia$Total[,7] <- df_cats_Zaporijia$Total[,7]/(length(cat_names)-1)
+```
+
+## Create new variables tracking changes in resumes, open positions, wages; shares of open position
+
+Due to change in frequency, we can't use data from the Excel tab "New" to calculate new variables tracking changes in resumes, open position, etc. Instead, we use *total* data to create growth rates of resumes, open positions and wages (both resume's and vacancy's) via the next formula:
+$$
+GR(Y_{t}) = \frac{Y_{t}-Y_{t-1}}{Y_{t-1}}
+$$
+
+```{r}
+# Create variable with relative changes
+for(i in 1:length(cat_names)) {
+  for(j in 4:7) {
+    temp <- (lag(df_cats_Zaporijia[[i]][,j], 0) -
+               lag(df_cats_Zaporijia[[i]][,j], 1))/lag(df_cats_Zaporijia[[i]][,j], 0)
+    df_cats_Zaporijia[[i]][ , ncol(df_cats_Zaporijia[[i]]) + 1] <- temp
+    colnames(df_cats_Zaporijia[[i]])[ncol(df_cats_Zaporijia[[i]])] <-
+      paste0("change_", names(df_cats_Zaporijia[[i]])[j])
+  }
+  df_cats_Zaporijia[[i]] <- df_cats_Zaporijia[[i]][-1,]
+}
+
+# Calculate shares of open position in total for each category
+for(i in 1:length(cat_names)) {
+    df_cats_Zaporijia[[i]]$share_vacancies <-
+      df_cats_Zaporijia[[i]]$total_vacancies/df_cats_Zaporijia$Total$total_vacancies
+}
+```
+
+## Visualize shares of open position in total for each category
+
+First, we plot all changes in open position shares in one plot normalized to 100%.
+
+```{r}
+# Bind categories into one data set
+df_Zaporijia <- lapply(df_cats_Zaporijia, as_tibble) %>% bind_rows() %>% group_split()
+df_Zaporijia <- df_Zaporijia[[1]]
+
+# Stacked plot
+p_shares_area <- ggplot(filter(df_Zaporijia, category != "Total"),
+       aes(x = month, y = round(share_vacancies*100, 2), fill = category)) + 
+    geom_area(alpha=0.6, colour="black") +
+  labs(title = "Shares of open position in total for each category",
+       y = "Share of total vacancies, %")
+```
+
+This plot is interactive. You can deselect categories by clicking them, highlight a category by double-click and see detailed information by hoovering the region.
+
+```{r}
+#| column: body-outset
+
+ggplotly(p_shares_area)
+```
+
+Next, we provide individual plots for a detailed view.
+
+```{r}
+# Individual plots
+# Make a list for plots
+plots_shares <- list()
+
+# Create a plot for each category
+for(i in c(1:28, 30)) {
+  plots_shares[[i]] <- df_cats_Zaporijia[[i]] %>%
+    select(1, share_vacancies) %>%
+    autoplot(round(share_vacancies*100, 2)) +
+    labs(title = cat_names[i],
+         y = "Share of total vacancies, %",
+         x = "Month")
+}
+
+# Delete empty object
+plots_shares <- compact(plots_shares)
+```
+
+For the purpose of comparability, we depict plots as grids of 3 by 3 figures.
+
+```{r fig.height=10, fig.width=13, warning=FALSE}
+#| column: body-outset
+
+grid.arrange(grobs = plots_shares[1:9],  nrow = 3, ncol = 3,
+     top = textGrob("Shares of open position in total for a category",
+                    gp = gpar(fontsize = 20, font = 1)))
+```
+
+```{r fig.height=10, fig.width=13, warning=FALSE}
+#| column: body-outset
+
+grid.arrange(grobs = plots_shares[10:18],  nrow = 3, ncol = 3,
+     top = textGrob("Shares of open position in total for a category",
+                    gp = gpar(fontsize = 20, font = 1)))
+```
+
+```{r fig.height=10, fig.width=13, warning=FALSE}
+#| column: body-outset
+
+grid.arrange(grobs = plots_shares[19:27],  nrow = 3, ncol = 3,
+     top = textGrob("Shares of open position in total for a category",
+                    gp = gpar(fontsize = 20, font = 1)))
+```
+
+```{r fig.height=4, fig.width=13, warning=FALSE}
+#| column: body-outset
+
+grid.arrange(grobs = plots_shares[28:29],  nrow = 1, ncol = 2,
+     top = textGrob("Shares of open position in total for a category",
+                    gp = gpar(fontsize = 20, font = 1)))
+```
+
+# Task
+::: {.callout-note appearance="simple"}
+## Task 2
+
+Use lasso, ridge regression, random forests and one non-linear estimation algorithm (of your own choosing) and select the best forecasting model of individual region percentage change in aggregate open positions, resumes and average salary per region and for individual categories within the region. Pay attention to the frequency of the input variables. 
+:::
+
+The process for section of the best forecasting model for variables of interest (change in open positions, change in vacancies, change in wages) for each category undergoes by the following algorithm:
+
+-   Exclude unnecessary variables --- positions, vacancies, wages in levels, indexes that don't change with time, shares of open positions (they are constant for some categories)
+
+-   Divide the data set on the train sample (first 100 observations) and test sample (remaining 10 ones) - Normalize variables by subtracting means and dividing by respective standard deviation
+
+-   Transform exogenous variables using the principal components method. Number of component is selected to cover 85% of variation in the original data
+
+-   For variables of interest for each category estimate four types of models using time-series cross-validation (also known as "evaluation on a rolling forecasting origin"):
+
+    -   Lasso
+
+    -   Ridge
+
+    -   Random Forest
+
+    -   Generalized Additive Model using Splines
+
+-   For each type of estimated models choose the best one using RMSE from cross-validation
+
+-   Calculate pseudo-out-of-sample predictions on the "test" set using the best model of each type
+
+-   For variables of interest for each category determine which class of models (out of four) yielded the lowest RMSE on the test sample. The result is "the best forecasting model"
+
+## Setup training parameters
+
+```{r}
+#| output: false
+#| warning: false
+
+# Correct missing value in Insurance category
+df_cats_Zaporijia$Insurance[103,43] <- df_cats_Zaporijia$Insurance[102,43]
+
+df_cats_Zaporijia_train <- list()
+df_cats_Zaporijia_test <- list()
+df_cats_Zaporijia_mod <- list()
+
+# Exclude unnecessary variables
+for(i in 1:length(cat_names)) {
+  df_cats_Zaporijia_mod[[i]] <- df_cats_Zaporijia[[i]] %>%
+    select(month, tw_count,Labor_index:MBA_degree_index,
+           change_total_resumes:change_wg_resumes)
+}
+
+
+# Divide the data to a train set (up to 2021 May) and test set (2021 Jun ~ 2022 Mar)
+for(i in 1:length(cat_names)) {
+  df_cats_Zaporijia_train[[i]] <- df_cats_Zaporijia_mod[[i]][1:100,]
+  df_cats_Zaporijia_test[[i]] <- df_cats_Zaporijia_mod[[i]] %>% setdiff(df_cats_Zaporijia_train[[i]])
+}
+
+# Set up parallel computing using 2 cores
+registerDoParallel(cores = 2)
+
+# Set parameters for training models for each category
+myTimeControl <- list()
+
+for(i in c(1:19, 21:length(cat_names))) {
+  myTimeControl[[i]] <- trainControl(method = "timeslice",
+                              initialWindow = 20,
+                              horizon = 4,
+                              fixedWindow = FALSE,
+                              allowParallel = TRUE,
+                              preProcess(df_cats_Zaporijia_train[[i]], c('scale', 'center', 'pca')),
+                              preProcOptions = list(thresh = 0.85))
+}
+
+# Set names for objects in lists
+names(df_cats_Zaporijia_train) <- cat_names
+names(df_cats_Zaporijia_test) <- cat_names
+names(myTimeControl) <- cat_names
+
+tuneLength.num <- 10
+
+var_names <- c("change_total_resumes","change_total_vacancies", "change_wg_resumes")
+fit_names <- c("ridge", "lasso", "rf", "gamSpline")
+
+# Calculate a number of training samples used in cross-validation
+length(seq(20, 96, 1))
+```
+
+Before we step to the estimation part, it is important to asses the number of models that we have to evaluate:\
+$$
+Number\ of\ models = 3\ response\ variables\ \cdot\ 29\ categories\ \cdot\ 4\ type\ of\ models\ \cdot\ 77\ CV\ samples\ =\ 26\ 796\
+$$
+
+Wow, that is an enormous amount of work to do and takes plenty of time to estimate of of them. Because of this reason, we only show the code to perform all this calculations below, but this document don't evaluate it. Instead, we saved estimation results as a pre-trained model and simply download it each time this code runs.
+
+```{r eval = FALSE}
+#| warning: false
+#| output: false
+
+# Estimate ML models using Principal Components method
+# for open positions, resumes and average salary by category
+
+# Uncomment the code below to estimate models
+# This code uses pre-trained models to reduce a runtime
+
+# # Make a list for models
+# fit_list <- vector(mode = "list", length = length(cat_names))
+# 
+# for (i in c(1:19, 21:length(cat_names))){
+#   # Create list for each variable
+#   fit_list[[i]] <- vector(mode = "list", length = length(var_names))
+#   for(j in 1:length(fit_names)) {
+#     fit_list[[i]][[1]] <- vector(mode = "list", length = length(fit_names))
+#     fit_list[[i]][[2]] <- vector(mode = "list", length = length(fit_names))
+#     fit_list[[i]][[3]] <- vector(mode = "list", length = length(fit_names))
+#   }
+# }
+# 
+# n <- names(df_cats_Zaporijia_train[[1]]) %>% setdiff(c("month", var_names[1]))
+# mod1 <- train(reformulate(n, var_names[1]),
+#                                      data = df_cats_Zaporijia_train[[1]],
+#                                      method = "lasso",
+#                                      trControl = myTimeControl[[1]],
+#                                      metric = 'RMSE',
+#                                      tuneLength = tuneLength.num,
+#                                      preProcess = c('scale', 'center', 'pca'),
+#                                      tuneGrid = expand.grid(fraction = seq(0.001, 1, length = 10)))
+# 
+# autoplot(tail(ts(predict(mod1, df_cats_Zaporijia_mod)), 10))
+# 
+# # Estimate ML models using Principal Components method
+# for (i in c(1:19, 21:length(cat_names))){
+#   for(j in 1:length(var_names)){
+#     n <- names(df_cats_Zaporijia_train[[i]]) %>% setdiff(c("month", var_names[j]))
+#     
+#     # Ridge model
+#     fit_list[[i]][[j]][[1]] <- train(reformulate(n, var_names[j]),
+#                                      data = df_cats_Zaporijia_train[[i]],
+#                                      method = "ridge",
+#                                      trControl = myTimeControl[[i]],
+#                                      metric = 'RMSE',
+#                                      tuneLength = tuneLength.num,
+#                                      preProcess = c('scale', 'center', 'pca'),
+#                                      tuneGrid = expand.grid(lambda = seq(0.001, 1, length = 10)))
+#     # Lasso model
+#     fit_list[[i]][[j]][[2]] <- train(reformulate(n, var_names[j]),
+#                                      data = df_cats_Zaporijia_train[[i]],
+#                                      method = "lasso",
+#                                      trControl = myTimeControl[[i]],
+#                                      metric = 'RMSE',
+#                                      tuneLength = tuneLength.num,
+#                                      preProcess = c('scale', 'center', 'pca'),
+#                                      tuneGrid = expand.grid(fraction = seq(0.001, 0.5, length = 10)))
+#     # Random forest model
+#     fit_list[[i]][[j]][[3]] <- train(reformulate(n, var_names[j]),
+#                                      data = df_cats_Zaporijia_train[[i]],
+#                                      method = "rf",
+#                                      trControl = myTimeControl[[i]],
+#                                      metric = 'RMSE',
+#                                      tuneLength = tuneLength.num,
+#                                      preProcess = c('scale', 'center', 'pca'))
+#     # GAM model
+#     fit_list[[i]][[j]][[4]] <- train(reformulate(n, var_names[j]),
+#                                      data = df_cats_Zaporijia_train[[i]],
+#                                      method = "gamSpline",
+#                                      trControl = myTimeControl[[i]],
+#                                      metric = 'RMSE',
+#                                      preProcess = c('scale', 'center', 'pca'),
+#                                      tuneGrid = expand.grid(df = seq(1, 5, length = 5)))
+#   }
+# }
+# 
+# # Set names for the objects in list of estimated models
+# names(fit_list) <- cat_names
+# for (i in c(1:19, 21:length(cat_names))){
+#   # Create list for each variable
+#   names(fit_list[[i]]) <- var_names
+#   names(fit_list[[i]][[1]]) <- fit_names
+#   names(fit_list[[i]][[2]]) <- fit_names
+#   names(fit_list[[i]][[3]]) <- fit_names
+# }
+# 
+# # save the list with estimation results to reduce code running time later
+# saveRDS(fit_list, "fit.Rds")
+```
+
+## Choose the best model
+
+Here we create a function that choose the best model of each type using RMSE from cross-validation and save in alongside with $R^2$.
+
+```{r}
+#| warning: false
+
+# Load pre-estimated models' parameters from the GitHub repo
+fit_list <- readRDS(url("https://github.com/Horovoi/ML-KSE-HW2/blob/main/fit.Rds?raw=true","rb"))
+
+# Define a helper function to extract the row with the best tuning parameters
+get_best_result = function(caret_fit) {
+  best = which(rownames(caret_fit$results) == rownames(caret_fit$bestTune))
+  best_result = caret_fit$results[best, ]
+  rownames(best_result) = NULL
+  best_result[2:3]
+}
+
+# Delete empty element from list
+fit_list <- compact(fit_list)
+```
+
+Next, we calculate pseudo-out-of-sample predictions on the "test" set from 2021 June to 2022 March using the best model of each type. We compare predictions with four types of models for each variable with the real-world data and calculate a few types of prediction errors.
+
+```{r}
+#| warning: false
+
+## Calculate predictions for the test sample
+names(df_cats_Zaporijia_mod) <- cat_names
+df_cats_Zaporijia_mod <- df_cats_Zaporijia_mod[-20]
+
+pred_list <- list()
+
+for (i in 1:length(fit_list)) {
+  pred_list[[i]] <- list()
+  for (j in 1:length(fit_list[[i]])) {
+    pred_list[[i]][[j]] <- lapply(fit_list[[i]][[j]],
+              function(x) {predict(x, df_cats_Zaporijia_mod[[i]])})
+  }
+}
+
+names(pred_list) <- cat_names[-20]
+for (i in 1:length(cat_names[-20])) {
+  # Create list for each variable
+  names(pred_list[[i]]) <- var_names
+}
+
+ts_pred_list <- list()
+ts_orig_list <- list()
+forecast_list <- list()
+acc_list <- list()
+plot_y_names <- c("%Δ in open resumes",
+                  "%Δin open positions",
+                  "%Δ in salary")
+
+## Plot predicted values vs real observations
+for (i in 1:length(pred_list)) {
+  ts_pred_list[[i]] <- list()
+  ts_orig_list[[i]] <- list()
+  forecast_list[[i]] <- list()
+  acc_list[[i]] <- list()
+  for (j in 1:length(pred_list[[i]])) {
+    ts_pred_list[[i]][[j]] <- lapply(pred_list[[i]][[j]],
+                                     function(x){ts(x, start = c(2013, 2), frequency = 12)})
+    ts_orig_list[[i]][[j]] <- ts(df_cats_Zaporijia_mod[[i]][[32+j]], start = c(2013, 2),
+                                 frequency = 12)
+    
+    forecast_list[[i]][[j]] <- forecast::autoplot(tail(ts_orig_list[[i]][[j]], 10)) +
+      lapply(seq_along(ts_pred_list[[i]][[j]]),
+             function(k) {autolayer(tail(ts_pred_list[[i]][[j]][[k]], 10),
+                                    series = fit_names[k])}) +
+      theme_minimal() +
+      labs(title = cat_names[-20][i], x = NULL, y = plot_y_names[j])
+    
+    # Calculate models' accuracy based on test data
+    acc_list[[i]][[j]] <- do.call(rbind.data.frame,
+               lapply(seq_along(ts_pred_list[[i]][[j]]),
+                      function(k) {forecast::accuracy(tail(ts_pred_list[[i]][[j]][[k]], 10),
+                                                      tail(ts_orig_list[[i]][[j]], 10))}))
+    rownames(acc_list[[i]][[j]]) <- fit_names
+  }
+}
+
+names(forecast_list) <- cat_names[-20]
+for (i in 1:length(cat_names[-20])) {
+  # Create list for each variable
+  names(forecast_list[[i]]) <- var_names
+}
+
+names(acc_list) <- cat_names[-20]
+for (i in 1:length(cat_names[-20])) {
+  # Create list for each variable
+  names(acc_list[[i]]) <- var_names
+}
+```
+
+In the section we plot pseudo-out-of-sample predictions for all variables on the "test" set.  
+```{r fig.height=10, fig.width=13, warning=FALSE}
+#| warning: false
+#| column: body-outset
+
+grid.arrange(grobs = c(forecast_list[[1]],
+                       forecast_list[[2]],
+                       forecast_list[[3]]),
+             nrow = 3, ncol = 3,
+             top = textGrob("Real Observations VS Predicted Values", gp = gpar(fontsize = 20, font = 1)))
+```
+
+```{r fig.height=10, fig.width=13, warning=FALSE}
+#| warning: false
+#| column: body-outset
+
+grid.arrange(grobs = c(forecast_list[[4]],
+                       forecast_list[[5]],
+                       forecast_list[[6]]),
+             nrow = 3, ncol = 3,
+             top = textGrob("Real Observations VS Predicted Values", gp = gpar(fontsize = 20, font = 1)))
+```
+
+```{r fig.height=10, fig.width=13, warning=FALSE}
+#| warning: false
+#| column: body-outset
+
+grid.arrange(grobs = c(forecast_list[[7]],
+                       forecast_list[[8]],
+                       forecast_list[[9]]),
+             nrow = 3, ncol = 3,
+             top = textGrob("Real Observations VS Predicted Values", gp = gpar(fontsize = 20, font = 1)))
+```
+
+```{r fig.height=10, fig.width=13, warning=FALSE}
+#| warning: false
+#| column: body-outset
+
+grid.arrange(grobs = c(forecast_list[[10]],
+                       forecast_list[[11]],
+                       forecast_list[[12]]),
+             nrow = 3, ncol = 3,
+             top = textGrob("Real Observations VS Predicted Values", gp = gpar(fontsize = 20, font = 1)))
+```
+
+```{r fig.height=10, fig.width=13, warning=FALSE}
+#| warning: false
+#| column: body-outset
+
+grid.arrange(grobs = c(forecast_list[[13]],
+                       forecast_list[[14]],
+                       forecast_list[[15]]),
+             nrow = 3, ncol = 3,
+             top = textGrob("Real Observations VS Predicted Values", gp = gpar(fontsize = 20, font = 1)))
+```
+
+```{r fig.height=10, fig.width=13, warning=FALSE}
+#| warning: false
+#| column: body-outset
+
+grid.arrange(grobs = c(forecast_list[[16]],
+                       forecast_list[[17]],
+                       forecast_list[[18]]),
+             nrow = 3, ncol = 3,
+             top = textGrob("Real Observations VS Predicted Values", gp = gpar(fontsize = 20, font = 1)))
+```
+
+```{r fig.height=10, fig.width=13, warning=FALSE}
+#| warning: false
+#| column: body-outset
+
+grid.arrange(grobs = c(forecast_list[[19]],
+                       forecast_list[[20]],
+                       forecast_list[[21]]),
+             nrow = 3, ncol = 3,
+             top = textGrob("Real Observations VS Predicted Values", gp = gpar(fontsize = 20, font = 1)))
+```
+
+```{r fig.height=10, fig.width=13, warning=FALSE}
+#| warning: false
+#| column: body-outset
+
+grid.arrange(grobs = c(forecast_list[[22]],
+                       forecast_list[[23]],
+                       forecast_list[[24]]),
+             nrow = 3, ncol = 3,
+             top = textGrob("Real Observations VS Predicted Values", gp = gpar(fontsize = 20, font = 1)))
+```
+
+```{r fig.height=10, fig.width=13, warning=FALSE}
+#| warning: false
+#| column: body-outset
+
+grid.arrange(grobs = c(forecast_list[[25]],
+                       forecast_list[[26]],
+                       forecast_list[[27]]),
+             nrow = 3, ncol = 3,
+             top = textGrob("Real Observations VS Predicted Values", gp = gpar(fontsize = 20, font = 1)))
+```
+
+```{r fig.height=7, fig.width=13, warning=FALSE}
+#| warning: false
+#| column: body-outset
+
+grid.arrange(grobs = c(forecast_list[[28]],
+                       forecast_list[[29]]),
+             nrow = 2, ncol = 3,
+             top = textGrob("Real Observations VS Predicted Values", gp = gpar(fontsize = 20, font = 1)))
+```
+
+
+## Selection of "The Best" model
+We build a summary table that display result for selection of the models with lowest RMSE using cross-validation and test sample prediction.
+```{r}
+#| warning: false
+
+## Build a summary for a selected models
+# Calculate number of rows in data frame
+n_row <- length(fit_list)*length(fit_list$Accounting)
+
+# Create empty df
+best_model_tbl <- data.frame("Category" = rep(NA, n_row),
+                             "Predicted_variable" = rep(NA, n_row),
+                             "Model_train" = rep(NA, n_row),
+                             "RMSE_train" = rep(NA, n_row),
+                             "R2" = rep(NA, n_row),
+                             "Model_test" = rep(NA, n_row),
+                             "RMSE_test" = rep(NA, n_row))
+
+# Create axillary list with best model for each variable
+aux_list1 <- list()
+aux_list2 <- list()
+aux_list_joint <- list()
+
+for (j in 1:length(fit_list)) {
+    aux_list1[[j]] <- lapply(fit_list[[j]], function(x) {
+        aux_rmse_train <- lapply(x, function(y) {(unlist(get_best_result(y))[1])})
+        aux_r2 <- lapply(x, function(y) {(unlist(get_best_result(y))[2])})
+        data.frame("Category" = "name_y",
+                   "Predicted_variable" = "name_x",
+                   "Model_train" = names(which.min(aux_rmse_train)),
+                   "RMSE_train" = unlist(aux_rmse_train)[which.min(aux_rmse_train)],
+                   "R2" = aux_r2[[names(which.min(aux_rmse_train))]])})
+    aux_list2[[j]] <- lapply(seq_along(acc_list[[j]]), function(x) {
+        aux_model <- lapply(acc_list[[j]], function(y) {which.min(unlist(y[2]))})
+        aux_rmse_test <- lapply(acc_list[[j]], function(y) {min(unlist(y[2]))})
+        data.frame("Model_test" = case_when(
+                     aux_model[x] == 1 ~ "ridge",
+                     aux_model[x] == 2 ~ "lasso",
+                     aux_model[x] == 3 ~ "rf",
+                     aux_model[x] == 4 ~ "gamSpline"),
+                   "RMSE_test" = aux_rmse_test[x])})
+    aux_list_joint[[j]] <- list()
+    
+    for (k in 1:length(acc_list[[j]])) {
+      aux_list_joint[[j]][[k]] <- cbind(aux_list1[[j]][[k]], aux_list2[[j]][[k]])
+      aux_list_joint[[j]][[k]][1] <- names(acc_list)[j]
+      aux_list_joint[[j]][[k]][2] <- names(acc_list[[j]])[k]
+  }
+}
+
+# Create final summary table for the best model
+seq_1 <- c(1:29)
+seq_2 <- c(30:58)
+seq_3 <- c(59:87)
+seq_list <- list(seq_1, seq_2, seq_3)
+
+for (j in 1:3) {
+  for (k in seq_list[[j]]) {
+     best_model_tbl[k,] <- aux_list_joint[[which(seq_list[[j]] == k)]][[j]] 
+  }
+}
+```
+
+For a mater of convenience, you can use a search bar to select a job category or/and predicted variable:
+
+-   *change_total_resumes* --- Percentage change in open positions.
+
+-   *change_total_vacancies* --- Percentage change in resumes.
+
+-   *change_wg_resumes* --- Percentage change in average expected salary.
+
+```{r}
+#| column: page
+#| warning: false
+
+# Table depicting best performing model for each category (lowest cross-validation RMSE)
+best_model_tbl %>% select(Category:RMSE_train, Model_test, RMSE_test) %>%
+  mutate_at(vars(RMSE_train, RMSE_test), funs(round(., 4))) %>%
+  datatable(options = list(pageLength = 87))
+```
+
+Let's analyse the results of estimation.
+
+```{r}
+#| warning: false
+
+# Change names of models to factors
+best_model_tbl %>%
+  mutate_at(vars(Predicted_variable, Model_train, Model_test), as_factor) -> best_model_tbl
+
+# Create a temporary table only containing results of cross-validation estination
+best_model_tbl %>% select(Model_train, Model_test) %>%
+  melt(id.vars = c("Model_test")) %>%
+  select(variable, value) -> temp_1
+
+# Create a temporary table only containing results of test sample estination
+best_model_tbl %>% select(Model_train, Model_test) %>%
+  melt(id.vars = c("Model_train")) %>%
+  select(variable, value) -> temp_2
+
+# Combine temporary tables
+fit_result <- bind_rows(temp_1, temp_2)
+```
+
+On the figure below you can see a comparison of distributional frequencies for the best forecasting model between cross-validation sample estimations and test sample estimations.
+
+```{r fig.height = 8, fig.width = 12}
+#| column: body-outset
+
+fit_result %>%
+  ggplot(aes(x = value, fill = variable)) +
+  geom_bar(position = "dodge", alpha = 0.9) +
+  geom_label(stat = 'count', aes(label=..count..),
+             position = position_dodge(width = 0.9), color = "white", fontface = "bold",
+             vjust = -0.2) + 
+  theme_minimal() +
+  labs(title = "Distribution of frequencies for the best forecasting model",
+       subtitle = "Cross-validation Sample VS Test Sample", y = "Frequency", x = "Model type") +
+  scale_fill_discrete(name = "Estimation Sample", labels = c("Cross-validation", "Test")) +
+  theme(legend.position = "bottom")
+```
+
+# Task
+::: {.callout-note appearance="simple"}
+## Task 3
+
+Try to improve on forecasts for individual categories (chose one category only) using changes in shares and salaries of neighboring regions’ categories as input variables.
+:::
+
+For this part we try to improve prediction accuracy (lower test sample RMSE) by adding changes in the same variable as endogenous one but for the nearby oblast. For the purpose of this task we select category "Healthcare, pharma" for which we will try to predict variables of interest for Zaporijia using variables for Dnipro.
+
+```{r}
+df_try_improve_full <- df_cats_Zaporijia_mod$`Healthcare, pharma`
+
+## Calculate changes for Dnipro
+# Select only Dnipro
+df_Total_Dnipro <- df_Total %>% filter(region == "Dnipro")
+df_Wage_Dnipro <- df_Wage %>% filter(region == "Dnipro")
+
+df_Dnipro <- merge(df_Total_Dnipro, df_Wage_Dnipro)
+
+# Create separate data set for each category
+df_pharma_Dnipro <- df_Dnipro %>% filter(category == "Healthcare, pharma")
+df_pharma_Dnipro$month <- floor_date(df_pharma_Dnipro$date, "month")
+df_pharma_Dnipro <- ddply(df_pharma_Dnipro, "month", numcolwise(mean))
+df_pharma_Dnipro <- df_pharma_Dnipro %>%
+  mutate(month = yearmonth(month)) %>%
+  as_tsibble(index = month)
+
+# Calculate percentage changes for Dnipro
+for(j in 2:5) {
+  temp <- (lag(df_pharma_Dnipro[,j], 0) -
+             lag(df_pharma_Dnipro[,j],1))/lag(df_pharma_Dnipro[,j], 0)
+  df_pharma_Dnipro[ , ncol(df_pharma_Dnipro) + 1] <- temp
+  colnames(df_pharma_Dnipro)[ncol(df_pharma_Dnipro)] <- paste0("change_Dnipro_", names(df_pharma_Dnipro)[j])
+}
+
+# Exclude unnesesary variables for Dnipro
+df_pharma_Dnipro <- df_pharma_Dnipro %>%
+  select(month, change_Dnipro_total_resumes:change_Dnipro_wg_resumes) %>% 
+  filter_index("2013 Feb" ~ "2022 Mar")
+
+# Add new variables to Zaporijia's data set
+df_try_improve_full <- full_join(df_try_improve_full, df_pharma_Dnipro, by = "month")
+```
+
+## Estimate new models adding changes for Dnipro
+```{r}
+# Set parameters
+
+# Divide the data to a train set (up to 2021 May) and test set (2021 Jun ~ 2022 Mar)
+df_try_improve_train <- df_try_improve_full[1:100,]
+df_try_improve_test <- df_try_improve_full %>% setdiff(df_try_improve_train)
+
+# Set parameters for training models
+myTimeControl2 <- list()
+
+seq_4 <- c(1:36)
+seq_5 <- c(1:35,37)
+seq_6 <- c(1:35,38)
+seq_list_2 <- list(seq_4, seq_5, seq_6)
+
+for (k in 1:3) {
+  myTimeControl2[[k]] <- trainControl(method = "timeslice",
+                                      initialWindow = 20,
+                                      horizon = 4,
+                                      fixedWindow = FALSE,
+                                      allowParallel = TRUE,
+                                      preProcess(df_try_improve_train[,seq_list_2[[k]]],
+                                                 c('scale', 'center', 'pca')),
+                                      preProcOptions = list(thresh = 0.85))
+}
+```
+
+```{r eval = FALSE}
+#| warning: false
+#| output: false
+
+# Uncomment the code below to estimate models
+# This code uses pre-trained models to reduce a runtime
+
+# Estimate updated models
+# # Make a list for models
+# fit_better_list <- vector(mode = "list", length = length(var_names))
+# 
+# # Estimate ML models using Principal Components method
+# for(j in 1:length(var_names)) {
+#   n <- names(df_try_improve_train[,seq_list_2[[j]]]) %>% setdiff(c("month", var_names[j]))
+#     
+#     # Ridge model
+#     fit_better_list[[j]][[1]] <- train(reformulate(n, var_names[j]),
+#                                 data = df_try_improve_train[,seq_list_2[[j]]],
+#                                 method = "ridge",
+#                                 trControl = myTimeControl2[[j]],
+#                                 metric = 'RMSE',
+#                                 tuneLength = tuneLength.num,
+#                                 preProcess = c('scale', 'center', 'pca'),
+#                                 tuneGrid = expand.grid(lambda = seq(0.001, 1, length = 10)))
+#     # Lasso model
+#     fit_better_list[[j]][[2]] <- train(reformulate(n, var_names[j]),
+#                                 data = df_try_improve_train[,seq_list_2[[j]]],
+#                                 method = "lasso",
+#                                 trControl = myTimeControl2[[j]],
+#                                 metric = 'RMSE',
+#                                 tuneLength = tuneLength.num,
+#                                 preProcess = c('scale', 'center', 'pca'),
+#                                 tuneGrid = expand.grid(fraction = seq(0.001, 1, length = 10)))
+#     # Random forest model
+#     fit_better_list[[j]][[3]] <- train(reformulate(n, var_names[j]),
+#                                 data = df_try_improve_train[,seq_list_2[[j]]],
+#                                 method = "rf",
+#                                 trControl = myTimeControl2[[j]],
+#                                 metric = 'RMSE',
+#                                 tuneLength = tuneLength.num,
+#                                 preProcess = c('scale', 'center', 'pca'))
+#     # GAM model
+#     fit_better_list[[j]][[4]] <- train(reformulate(n, var_names[j]),
+#                                 data = df_try_improve_train[,seq_list_2[[j]]],
+#                                 method = "gamSpline",
+#                                 trControl = myTimeControl2[[j]],
+#                                 metric = 'RMSE',
+#                                 preProcess = c('scale', 'center', 'pca'),
+#                                 tuneGrid = expand.grid(df = seq(1, 5, length = 5)))
+# }
+# 
+# # Set names for the objects in list of estimations
+# names(fit_better_list) <- var_names
+# for(i in 1:3) {
+#   names(fit_better_list[[i]]) <- fit_names
+# }
+# 
+# saveRDS(fit_better_list, "fit_Dnipro.Rds")
+```
+
+
+## Calculate pseudo-out-of-sample predictions on the "test" set for adjusted models
+
+```{r}
+#| warning: false
+
+# Load pre-estimated models' parameters from the GitHub repo
+fit_better_list <- readRDS(url("https://github.com/Horovoi/ML-KSE-HW2/blob/main/fit_Dnipro.Rds?raw=true", "rb"))
+
+pred_better_list <- list()
+
+for (i in 1:length(fit_better_list)) {
+  pred_better_list[[i]] <- lapply(fit_better_list[[i]],
+                                  function(x) {predict(x, df_try_improve_full)})
+}
+
+names(pred_better_list) <- var_names
+
+ts_pred_better_list <- list()
+ts_orig_better_list <- list()
+forecast_better_list <- list()
+acc_better_list <- list()
+
+for (i in 1:length(fit_better_list)) {
+  ts_pred_better_list[[i]] <- lapply(pred_better_list[[i]],
+                                     function(x){ts(x, start = c(2013, 2), frequency = 12)})
+  ts_orig_better_list[[i]] <- ts(df_try_improve_full[[32+i]], start = c(2013, 2), frequency = 12)
+  
+  forecast_better_list[[i]] <- forecast::autoplot(tail(ts_orig_better_list[[i]], 10)) +
+    lapply(seq_along(ts_pred_better_list[[i]]),
+           function(k) {autolayer(tail(ts_pred_better_list[[i]][[k]], 10), series = fit_names[k])}) +
+      theme_minimal() +
+      labs(title = paste0(plot_y_names[i], " in Healthcare, pharma"),
+           subtitle = "Improved with data on Dnipro",
+           x = NULL, y = "%Δ")
+  
+  # Calculate models' accuracy based on test data
+    acc_better_list[[i]] <- do.call(rbind.data.frame,
+                                    lapply(seq_along(ts_pred_better_list[[i]]),
+                      function(k) {forecast::accuracy(tail(ts_pred_better_list[[i]][[k]], 10),
+                                                      tail(ts_orig_better_list[[i]], 10))}))
+    rownames(acc_better_list[[i]]) <- fit_names
+}
+
+names(forecast_better_list) <- var_names
+names(acc_better_list) <- var_names
+```
+
+```{r fig.height=4, fig.width=13, warning=FALSE}
+#| warning: false
+#| column: body-outset
+
+grid.arrange(grobs = forecast_better_list,
+             nrow = 1, ncol = 3,
+             top = textGrob("Real Observations VS Predicted Values", gp = gpar(fontsize = 20, font = 1)))
+```
+
+```{r}
+# Build a summary table 
+aux_better_train <- list()
+aux_better_train <- lapply(fit_better_list, function(x) {
+  l1 <- lapply(x, function(y) {(unlist(get_best_result(y))[1])})
+  l2 <- lapply(x, function(y) {(unlist(get_best_result(y))[2])})
+  data.frame("Category" = "name_y",
+           "Predicted_variable" = "name_x",
+           "Model_train" = names(which.min(l1)),
+           "RMSE_train" = unlist(l1)[which.min(l1)],
+           "R2" = l2[[names(which.min(l1))]])
+})
+
+better_model <- numeric()
+aux_better_test <- list()
+aux_better_full <- list()
+better_best_model_tbl <- data.frame("Category" = rep(NA, length(var_names)),
+                                    "Predicted_variable" = rep(NA, length(var_names)),
+                                    "Model_train" = rep(NA, length(var_names)),
+                                    "RMSE_train" = rep(NA, length(var_names)),
+                                    "R2" = rep(NA, length(var_names)),
+                                    "Model_test" = rep(NA, length(var_names)),
+                                    "RMSE_test" = rep(NA, length(var_names)))
+
+for(i in 1:length(acc_better_list)) {
+  better_model[i] <- which.min(unlist(acc_better_list[[i]][2]))
+  aux_better_test[[i]] <- data.frame("Model_test" = case_when(better_model[i] == 1 ~ "ridge",
+                                                              better_model[i] == 2 ~ "lasso",
+                                                              better_model[i] == 3 ~ "rf",
+                                                              better_model[i] == 4 ~ "gamSpline"),
+                                     "RMSE_test" = min(unlist(acc_better_list[[i]][2])))
+  
+  aux_better_full[[i]] <- cbind(aux_better_train[[i]], aux_better_test[[i]])
+  aux_better_full[[i]][1] <- "Healthcare, pharma"
+  aux_better_full[[i]][2] <- var_names[i]
+  
+  better_best_model_tbl[i,] <- aux_better_full[[i]] 
+}
+```
+
+
+## Evaluation of the models with added changes in Dnipro's variables
+
+Let's compare the results with a base model
+
+```{r}
+#| column: page
+
+best_model_tbl %>% mutate(Forecast = "Basic") -> comp_tbl_1
+better_best_model_tbl %>% mutate(Forecast = "+ Dnipro") -> comp_tbl_2
+comp_tbl_rmse <- bind_rows(comp_tbl_1, comp_tbl_2)
+
+comp_tbl_rmse %>%
+  filter(Category == "Healthcare, pharma") %>%
+  select(Forecast, Predicted_variable:RMSE_train, Model_test, RMSE_test, R2) %>%
+  mutate_at(vars(RMSE_train, RMSE_test, R2), funs(round(., 3))) %>%
+  datatable(options = list(pageLength = 6))
+```
+
+Addition of changes in parameters of neighboring regions' categories helps to reduce test errors for individual categories (by the example of "Healthcare, pharma").
